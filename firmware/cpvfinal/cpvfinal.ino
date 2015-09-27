@@ -1,0 +1,1608 @@
+//#include <msp430g2955.h>
+
+struct badgeNVM_t {
+  char flags[12][8];
+  char padding[28];
+  //byte flagHashes[12][16];
+  unsigned short challengesSolved;
+  byte selfTestEnabled;
+  byte padding2[1];
+  // Next segment
+  byte partyTime[8];
+  byte modeFlags;
+};
+
+badgeNVM_t *nvm = (badgeNVM_t *)0x1000;
+
+#define IGNORE_LEFT_UP  (1 << 7)
+#define IGNORE_RIGHT_UP (1 << 6)
+#define LEFT_PRESSED    (1 << 5)
+#define RIGHT_PRESSED   (1 << 4)
+#define LEFT_UP         (1 << 3)
+#define RIGHT_UP        (1 << 2)
+#define LEFT_DOWN       (1 << 1)
+#define RIGHT_DOWN      (1 << 0)
+
+byte tempModeFlag = 0;
+byte buttonStatus = 0;
+byte maxLEDBrightness = 0xff;
+byte curString = 0;
+
+enum badgeState_t {
+  SELF_TEST_MODE,
+  DISPLAY_MODE,
+  FLAG_ENTRY_MODE,
+  FLAG_OBTAINED_MODE,
+  FLAG_FAIL_MODE,
+  SCROLL_MODE,
+  RF_MODE,
+  PARTY_CONFIRM_MODE,
+  PARTY_MODE,
+  SSE_MODE,
+  SHOW_FLAG_MODE,
+};
+
+badgeState_t badgeState;
+
+#define MODE_FLAG_PARTY         (1 << 0)
+#define MODE_FLAG_FUCK          (1 << 1)
+#define MODE_FLAG_EFF_SUPPORTER (1 << 2)
+
+#define TEMP_MODE_FLAG_MATRIX        (1 << 2)
+#define TEMP_MODE_FLAG_BULLET_TIME   (1 << 3)
+#define TEMP_MODE_FLAG_EGG_MSG       (1 << 4)
+#define TEMP_MODE_FLAG_LED1          (1 << 5)
+#define TEMP_MODE_FLAG_LED2          (2 << 5)
+#define TEMP_MODE_FLAG_COUNT         (3 << 5)
+#define TEMP_MODE_FLAG_PONG          (4 << 5)
+
+void unlockFlash()
+{
+  disableWatchDog();
+  FCTL3 = FWKEY;
+  FCTL2 = FWKEY + FSSEL1+((F_CPU/400000L) & 63);
+  FCTL1 = FWKEY | WRT;
+}
+ 
+void lockFlash()
+{
+  FCTL1 = FWKEY;
+  FCTL3 = FWKEY | LOCK;
+  enableWatchDog();
+}
+
+void eraseFlash()
+{
+  disableWatchDog();
+  FCTL3 = FWKEY;
+  FCTL1 = FWKEY + ERASE;
+  nvm->flags[0][0] = 0xff;
+  while (FCTL3 & BUSY);
+  FCTL1 = FWKEY + ERASE;
+  nvm->flags[8][0] = 0xff;
+  while (FCTL3 & BUSY);
+  FCTL1 = FWKEY + ERASE;
+  nvm->partyTime[0] = 0xff;
+  while (FCTL3 & BUSY);
+  FCTL1 = FWKEY;
+  FCTL3 = FWKEY | LOCK;
+  enableWatchDog();
+}
+
+void erasePersistantModes()
+{
+  disableWatchDog();
+  FCTL3 = FWKEY;
+  FCTL1 = FWKEY + ERASE;
+  nvm->partyTime[0] = 0xff;
+  while (FCTL3 & BUSY);
+  FCTL1 = FWKEY;
+  FCTL3 = FWKEY | LOCK;
+  enableWatchDog();
+}
+
+static const byte numCharTable[] = {
+  0x5F, 0x05, 0x73, 0x75, 0x2D, 0x7C, 0x7E, 0x45,
+  0x7F, 0x6D
+}; 
+
+static const byte alphaCharTable[] = {
+  0x6F, 0x3E, 0x5a, 0x37, 0x7A, 0x6A, 0x5e, 0x2E,
+  0x0A, 0x17, 0x6e, 0x1A, 0x46, 0x4f, 0x36, 0x6B,
+  0x6D, 0x4b, 0x5C, 0x3a, 0x1f, 0x1d, 0x19, 0x2f,
+  0x3D, 0x53
+};
+
+void setAnodes(char c)
+{
+  byte anodes = 0;
+  
+  if (c >= '0' && c <= '9') {
+    anodes = numCharTable[c - '0'];
+  } else if (c >= 'A' && c <= 'Z') {
+    anodes = alphaCharTable[c - 'A'];
+  } else if (c >= 'a' && c <= 'z') {
+    anodes = alphaCharTable[c - 'a'];
+  } else if (c & 0x80) {
+    anodes = c & 0x7f;
+  }
+  
+  P1OUT = (P1OUT & 0xc0) | (anodes & 0x3f);
+  if (anodes & 0x40) {
+    P2OUT |= (1 << 4);
+  } else {
+    P2OUT &= ~(1 << 4);
+  }
+}
+
+char dispBuf[8]; // 7-segment display buffer
+byte ledBuf[12]; // Ring of LEDs buffer
+byte charPos = 0;
+byte pwmCount = 0;
+//byte ledPos = 0;
+
+void refreshDisplay()
+{
+  byte ledPos;
+  
+  // Cathodes high, anodes low
+  P1OUT = 0xc0;
+  P2OUT = 0xff;
+  P3OUT = 0xff;
+  P4OUT = 0xff;
+
+  setAnodes(dispBuf[charPos]);
+  switch (charPos) {
+  case 0:
+    P1OUT &= ~(1 << 7);
+    break;
+  case 1:
+    P1OUT &= ~(1 << 6);
+    break;
+  case 2:
+    P3OUT &= ~(1 << 0);
+    break;
+  case 3:
+    P2OUT &= ~(1 << 2);
+    break;
+  case 4:
+    P2OUT &= ~(1 << 1);
+    break;
+  case 5:
+    P2OUT &= ~(1 << 0);
+    break;
+  case 6:
+    P2OUT &= ~(1 << 6);
+    break;
+  case 7:
+    P2OUT &= ~(1 << 7);
+    break;
+  }
+  
+  // Increment charPos, mod 8
+  charPos = (charPos + 1) & 0x7;
+
+  for (ledPos = 0; ledPos < 12; ledPos++) {  
+    if ((ledBuf[ledPos] >> 3) >= pwmCount && pwmCount) {
+      switch(ledPos) {
+      case 0:
+        P4OUT &= ~(1 << 5);
+        break;
+      case 1:
+        P4OUT &= ~(1 << 4);
+        break;
+      case 2:
+        P4OUT &= ~(1 << 3);
+        break;
+      case 3:
+        P4OUT &= ~(1 << 1);
+        break;
+      case 4:
+        P4OUT &= ~(1 << 2);
+        break;
+      case 5:
+        P2OUT &= ~(1 << 3);
+        break;
+      case 6:
+        P3OUT &= ~(1 << 7);
+        break;
+      case 7:
+        P3OUT &= ~(1 << 6);
+        break;
+      case 8:
+        P3OUT &= ~(1 << 5);
+        break;
+      case 9:
+        P3OUT &= ~(1 << 4);
+        break;
+      case 10:
+        P4OUT &= ~(1 << 7);
+        break;
+      case 11:
+        P4OUT &= ~(1 << 6);
+        break;
+      }
+    }
+  }
+  
+  pwmCount = (pwmCount + 1) & 0x1f;
+  /*
+  ledPos++;
+  if (ledPos >= 12) {
+    ledPos = 0;
+  }
+  */
+}
+
+void updateButtonStatus()
+{
+  static unsigned short leftButtonSR = 0;
+  static unsigned short rightButtonSR = 0;
+  
+  leftButtonSR <<= 1;
+  rightButtonSR <<= 1;
+  if (P3IN & (1 << 3))
+    leftButtonSR |= 1;
+    //rightButtonSR |= 1;
+  if (P2IN & (1 << 5))
+    rightButtonSR |= 1;
+    //leftButtonSR |= 1;
+    
+  buttonStatus &= ~(LEFT_UP | RIGHT_UP | LEFT_DOWN | RIGHT_DOWN);
+  if (leftButtonSR == 0) {
+    if (buttonStatus & LEFT_PRESSED) {
+      if (!(buttonStatus & IGNORE_LEFT_UP))
+        buttonStatus |= LEFT_UP;
+      buttonStatus &= ~(IGNORE_LEFT_UP | LEFT_PRESSED);
+    }
+  } else if (leftButtonSR == 0xffff) {
+    if (!(buttonStatus & LEFT_PRESSED)) {
+      buttonStatus |= LEFT_PRESSED | LEFT_DOWN;
+    }
+  }
+  
+  if (rightButtonSR == 0) {
+    if (buttonStatus & RIGHT_PRESSED) {
+      if (!(buttonStatus & IGNORE_RIGHT_UP))
+        buttonStatus |= RIGHT_UP;
+      buttonStatus &= ~(IGNORE_RIGHT_UP | RIGHT_PRESSED);
+    }
+  } else if (rightButtonSR == 0xffff) {
+    if (!(buttonStatus & RIGHT_PRESSED)) {
+      buttonStatus |= RIGHT_PRESSED | RIGHT_DOWN;
+    }
+  }
+}
+
+unsigned short lfsr(int nIters)
+{
+  static unsigned short _lfsr = 1;
+  
+  while (nIters--) {
+    unsigned short lsb = _lfsr & 1;
+    _lfsr >>= 1;
+    _lfsr ^= (-lsb) & 0xb400;
+  }
+  
+  return _lfsr;
+}
+
+#define MX (z>>5^y<<2) + (y>>3^z<<4) ^ (sum^y) + (k[p&3^e]^z);
+  
+long btea(long* v, long n, long* k) {
+  unsigned long z, y=v[0], sum=0, e, DELTA=0x9e3779b9;
+  long p, q ;
+  if (n > 1) {          /* Coding Part */
+    z = v[n - 1];
+    q = 6 + 52/n;
+    while (q-- > 0) {
+      sum += DELTA;
+      e = (sum >> 2) & 3;
+      for (p=0; p<n-1; p++) y = v[p+1], z = v[p] += MX;
+      y = v[0];
+      z = v[n-1] += MX;
+    }
+    return 0 ; 
+  } else if (n < -1) {  /* Decoding Part */
+    n = -n;
+    z = v[n - 1];
+    q = 6 + 52/n;
+    sum = q*DELTA ;
+    while (sum != 0) {
+      e = (sum >> 2) & 3;
+      for (p=n-1; p>0; p--) z = v[p-1], y = v[p] -= MX;
+      z = v[n-1];
+      y = v[0] -= MX;
+      sum -= DELTA;
+    }
+    return 0;
+  }
+  return 1;
+}
+
+#define NITERS 3000
+const byte flags[12][16] = {
+  { 0xd0, 0x9a, 0xca, 0x37, 0xe9, 0x65, 0x86, 0x52, 0x50, 0xf8, 0xf3, 0xb3, 0x4f, 0x72, 0xc9, 0xad, },
+  { 0x87, 0xd9, 0x22, 0x80, 0xaa, 0xd5, 0x7d, 0x25, 0x1a, 0x49, 0x82, 0x3b, 0x76, 0xa5, 0xbb, 0x17, },
+  { 0x4c, 0xac, 0xd0, 0xf3, 0x76, 0xbd, 0xdf, 0xd8, 0x4d, 0x90, 0xc3, 0xa1, 0x0a, 0x07, 0xa7, 0xf4, },
+  { 0x38, 0x96, 0xdd, 0xc4, 0xdd, 0x08, 0xe3, 0x60, 0xb2, 0xb2, 0x0a, 0x57, 0x06, 0x92, 0x58, 0xa2, },
+  { 0x18, 0xd6, 0x0f, 0x7e, 0xc1, 0xb8, 0x52, 0xa1, 0xc5, 0x51, 0xe6, 0x6c, 0x52, 0x48, 0x28, 0xc5, },
+  { 0x6e, 0xb6, 0xe0, 0xc3, 0x71, 0x22, 0xcd, 0x46, 0xd2, 0xc8, 0xd7, 0xe0, 0xfc, 0x81, 0x2f, 0x88, },
+  { 0xf5, 0x49, 0x72, 0x81, 0xef, 0x2c, 0xec, 0x8c, 0x65, 0x98, 0xb4, 0x36, 0x01, 0xbf, 0xb2, 0x03, },
+  { 0xa2, 0xa0, 0x3a, 0xe1, 0xbe, 0xce, 0x66, 0x42, 0x25, 0x51, 0x81, 0xed, 0x0b, 0xbe, 0x61, 0xac, },
+  { 0x14, 0x71, 0x96, 0x90, 0x8a, 0x52, 0xd0, 0x6c, 0xa0, 0x8a, 0x00, 0x40, 0xab, 0xa8, 0xcf, 0x16, },
+  { 0xe3, 0xc8, 0x36, 0x40, 0x53, 0x3e, 0xb1, 0xa7, 0x7a, 0x76, 0x93, 0xa4, 0xf2, 0x83, 0x29, 0x14, },
+  { 0x3b, 0xbb, 0xd9, 0x9f, 0x99, 0x06, 0x42, 0x20, 0xd6, 0xbf, 0xfc, 0xfc, 0xe3, 0xb9, 0x6c, 0xc7, },
+  { 0x61, 0x14, 0x09, 0x6a, 0x73, 0x9c, 0x94, 0x55, 0xf3, 0x3a, 0x75, 0x75, 0xd0, 0x1f, 0x0c, 0x79, },
+};
+
+const byte easterEggs[][16] = {
+  { 0x7c, 0xfd, 0x7f, 0x9c, 0x96, 0x3f, 0x83, 0x42, 0x1e, 0x68, 0x02, 0xcd, 0x57, 0x04, 0xf4, 0x40, }, // matrix
+  { 0x1a, 0x0a, 0x11, 0x68, 0x1d, 0x3b, 0x26, 0xb7, 0x6c, 0xa1, 0xfe, 0x57, 0xa4, 0x5b, 0xa1, 0xb9, }, // hack
+  { 0x79, 0x30, 0x3b, 0xce, 0x1e, 0xea, 0xea, 0x4d, 0xac, 0xd1, 0x95, 0xf6, 0x60, 0x93, 0x15, 0x78, }, // 1337
+  { 0xa6, 0x5f, 0xbd, 0xb0, 0xdb, 0xe1, 0x63, 0x11, 0xc7, 0x53, 0xd8, 0xed, 0xed, 0x37, 0xd8, 0x65, }, // cyber
+  { 0x89, 0x02, 0x78, 0x20, 0x7e, 0x5a, 0x88, 0xcd, 0x04, 0xb9, 0xbc, 0xb8, 0xc1, 0xcf, 0xf6, 0x8e, }, // cyber2
+  { 0xdb, 0x96, 0xea, 0xd8, 0xd3, 0xd3, 0xa5, 0xbe, 0x63, 0x49, 0x98, 0x7f, 0xdb, 0x01, 0xbf, 0x92, }, // wbm
+  { 0x3a, 0xfa, 0x2d, 0x0c, 0x74, 0x52, 0xe6, 0xde, 0x5b, 0x1b, 0x6f, 0x14, 0x81, 0x50, 0xd8, 0xbb, }, // supersat
+  { 0x63, 0x29, 0x74, 0x9f, 0x98, 0x81, 0xfe, 0xba, 0xd2, 0x5e, 0x71, 0x00, 0xb4, 0xb1, 0xc0, 0xc6, }, // jorge
+  { 0x21, 0xfb, 0xc9, 0xf7, 0x53, 0x24, 0x22, 0x4e, 0xcb, 0x40, 0x38, 0xb4, 0x66, 0x7d, 0xc7, 0x88, }, // gibson
+  { 0x24, 0x32, 0x1c, 0x25, 0xc7, 0x43, 0x01, 0x43, 0x48, 0xe5, 0x79, 0x8e, 0xea, 0x2b, 0xa1, 0xaa, }, // acidburn
+  { 0xfd, 0x50, 0xe4, 0xbc, 0xba, 0x76, 0xb2, 0xb7, 0xc9, 0x42, 0xb0, 0x2d, 0x88, 0x05, 0x68, 0x2b, }, // zerocool
+  { 0xa9, 0xa4, 0x3f, 0xd2, 0x99, 0x6e, 0x5e, 0xe6, 0x90, 0x32, 0x5d, 0xcf, 0xbf, 0xef, 0xea, 0x9c, }, // joegrand
+  { 0x04, 0x66, 0x67, 0xc1, 0xde, 0x29, 0xa6, 0x4a, 0xf5, 0x22, 0x76, 0x6d, 0xa6, 0x23, 0x9f, 0x72, }, // jeffmoss
+  { 0xdd, 0xed, 0x3f, 0xd0, 0x3b, 0x28, 0x40, 0xff, 0x9a, 0x6a, 0x78, 0x14, 0x8f, 0xd2, 0xb0, 0xa4, }, // travis
+  { 0x8d, 0x51, 0x54, 0xcf, 0xd6, 0xb2, 0x4c, 0xea, 0xe4, 0x37, 0xf2, 0x4d, 0x4b, 0xed, 0x10, 0xc7, }, // ossmann
+  { 0x9e, 0x55, 0x9a, 0xfe, 0x68, 0x49, 0xaa, 0x81, 0x3d, 0x0a, 0xfa, 0x7c, 0x5f, 0xcd, 0x6d, 0xe5, }, // gmark  
+  { 0x27, 0x8e, 0x28, 0xcb, 0x64, 0xa6, 0xc2, 0xeb, 0x1a, 0xa8, 0xee, 0x2c, 0x53, 0x4b, 0x95, 0x5e, }, // nsa
+  { 0xef, 0xd4, 0x53, 0xf8, 0xfe, 0x44, 0x18, 0x0c, 0xf5, 0x85, 0xae, 0x3e, 0xbe, 0x2a, 0xa6, 0xd7, }, // goon
+  { 0x95, 0x2e, 0x77, 0xed, 0x8d, 0xd9, 0x93, 0x9a, 0x87, 0x03, 0x6f, 0x70, 0x7c, 0x3a, 0xb9, 0x74, }, // beer
+  { 0x9f, 0x03, 0x74, 0x48, 0xf6, 0x14, 0x6a, 0x3f, 0xd5, 0x71, 0x32, 0x22, 0x0a, 0xc3, 0x06, 0x3a, }, // had
+  { 0xf2, 0x0d, 0x2b, 0x37, 0xf6, 0x52, 0xea, 0xe1, 0x1e, 0xd4, 0x16, 0x16, 0xc8, 0xe7, 0x02, 0xf2, }, // ninja
+  { 0x6d, 0x28, 0x5a, 0xbb, 0x2e, 0x19, 0x8e, 0xff, 0x01, 0x51, 0x4d, 0x49, 0x3e, 0x7c, 0x9d, 0xdc, }, // neon
+  { 0x24, 0x5c, 0x97, 0x45, 0x0c, 0xcc, 0x64, 0xc4, 0x54, 0x2a, 0x11, 0x3a, 0xff, 0x79, 0x95, 0x99, }, // diffie
+  { 0xdc, 0x57, 0x77, 0x64, 0xee, 0x87, 0x4c, 0xd6, 0x64, 0x30, 0x06, 0x57, 0x79, 0x6c, 0x4b, 0x33, }, // hellman
+  { 0xf6, 0x54, 0x5a, 0x0f, 0xac, 0x5e, 0x98, 0x19, 0x2b, 0x2b, 0xcd, 0x84, 0x33, 0xa4, 0x58, 0x85, }, // 1057
+  { 0x14, 0xf7, 0x67, 0xfd, 0x6b, 0xc6, 0x5b, 0x26, 0xbd, 0x6c, 0xe1, 0xc4, 0x38, 0x5e, 0xc3, 0xb7, }, // knight
+  { 0x6f, 0xea, 0x66, 0x53, 0x2d, 0x7f, 0xcf, 0x15, 0x88, 0xc6, 0xfa, 0xfe, 0x65, 0xd1, 0x09, 0x7f, }, // fuck
+  { 0xf4, 0x00, 0x35, 0x86, 0x51, 0x9e, 0x86, 0xa7, 0xf1, 0x71, 0x46, 0x5e, 0xb3, 0xc9, 0xdc, 0xb3, }, // defcon
+  { 0xeb, 0x0c, 0xe6, 0xb4, 0x10, 0x6b, 0x00, 0xd8, 0x93, 0xd5, 0xdc, 0x54, 0x14, 0x6f, 0xeb, 0xbc, }, // defcoin
+  { 0xd8, 0x09, 0x9d, 0xa3, 0x72, 0x29, 0x09, 0xe9, 0x07, 0x4e, 0x63, 0x73, 0xf9, 0x17, 0x67, 0xf1, }, // alice
+  { 0x79, 0x42, 0x59, 0x82, 0xae, 0x36, 0x66, 0xec, 0x7d, 0xb4, 0x63, 0x65, 0x34, 0x58, 0x1b, 0xc8, }, // bob
+  { 0x68, 0xf6, 0xda, 0xdf, 0x75, 0x86, 0x4d, 0xb5, 0x4d, 0x3e, 0x0f, 0x39, 0xc6, 0xb2, 0xba, 0x63, }, // eve
+  { 0x74, 0x08, 0x80, 0xde, 0x32, 0x38, 0xc4, 0x25, 0x54, 0x5f, 0xb2, 0x98, 0x17, 0xf8, 0x3a, 0xeb, }, // eff
+  { 0x86, 0x31, 0x5f, 0xfd, 0x63, 0x18, 0xec, 0x9b, 0xb6, 0x34, 0xb8, 0xe8, 0xbc, 0xd1, 0x9e, 0xf2, }, // rot13
+  { 0xc2, 0x2c, 0xcf, 0x64, 0x51, 0xb5, 0x19, 0x70, 0x34, 0x4b, 0xdd, 0x8c, 0x04, 0x14, 0x6e, 0x44, }, // openssl
+  { 0xe7, 0xcc, 0xd8, 0x45, 0xd7, 0x68, 0x7b, 0x9e, 0x10, 0xd2, 0x38, 0xa5, 0xcd, 0x0b, 0xd6, 0x65, }, // darthnul
+  { 0x01, 0x98, 0x03, 0x88, 0xa7, 0x18, 0x1a, 0xd5, 0xb3, 0xac, 0x49, 0x6f, 0xa3, 0xcd, 0xd5, 0x38, }, // wargames
+  { 0x38, 0xb9, 0xb0, 0x31, 0x58, 0xc5, 0xf2, 0xcd, 0xd8, 0xeb, 0x1c, 0xe9, 0xaf, 0x0c, 0x06, 0x4a, }, // thenet
+  { 0xec, 0xbc, 0x28, 0xa0, 0x2f, 0xc6, 0x94, 0x57, 0xf3, 0x4b, 0x36, 0xd1, 0x6c, 0xe7, 0x96, 0xa7, }, // sneakers
+  { 0xf6, 0x76, 0x25, 0xde, 0xf6, 0x2c, 0xbf, 0x81, 0xcf, 0x27, 0x1a, 0x7b, 0xa7, 0x4d, 0x90, 0xd8, }, // setec
+  { 0x86, 0x99, 0x6f, 0x3b, 0x5f, 0x54, 0x90, 0x47, 0xaa, 0xb3, 0xa3, 0x20, 0xca, 0xa0, 0x30, 0xc6, }, // lotr
+  { 0xb9, 0xcf, 0xf5, 0x7d, 0x47, 0x93, 0xce, 0xa8, 0xe1, 0x28, 0xd6, 0x3e, 0xd2, 0x8a, 0x13, 0xc8, }, // led1
+  { 0xfd, 0x4f, 0x52, 0x4a, 0x58, 0x2a, 0xe1, 0xab, 0xed, 0x68, 0x40, 0x9f, 0x12, 0x35, 0xfa, 0xec, }, // led2
+  { 0x2f, 0x5d, 0x1c, 0x8b, 0x36, 0xe4, 0xfa, 0x0f, 0x4e, 0xd4, 0x7d, 0x2d, 0xd8, 0x2e, 0xa4, 0x35, }, // pong
+  { 0xab, 0xf1, 0xfd, 0x22, 0x8f, 0xc6, 0xa6, 0x43, 0xd6, 0xfa, 0x70, 0xce, 0x2f, 0x22, 0x22, 0x54, }, // party
+  { 0x44, 0xf1, 0x00, 0xfc, 0xc6, 0x78, 0x40, 0xd3, 0x0d, 0x02, 0x89, 0xac, 0x45, 0xfc, 0x75, 0x01, }, // rager
+  { 0xaa, 0x8f, 0x49, 0xe3, 0x8f, 0x28, 0x31, 0xbd, 0xb5, 0x31, 0xb4, 0x10, 0x03, 0xc6, 0x37, 0x80, }, // scorpion
+  { 0xe9, 0xab, 0x4d, 0x4c, 0x12, 0x59, 0x91, 0x44, 0xef, 0xc7, 0x91, 0x2b, 0xf5, 0xd4, 0xc9, 0xe9, }, // 3ffd0n0r
+  { 0x64, 0xe8, 0x8b, 0xba, 0xf0, 0x30, 0x48, 0x65, 0x61, 0x08, 0x8f, 0xcf, 0x0c, 0x70, 0x25, 0xd9, }, // tetris
+  { 0xf8, 0x7d, 0x71, 0x0e, 0xbd, 0xfd, 0x2d, 0x3b, 0x67, 0xa8, 0x0a, 0x46, 0xf5, 0xbd, 0xd0, 0x6c, }, // overclok
+  { 0xdf, 0x15, 0x65, 0xfd, 0xa4, 0xb6, 0x3a, 0x06, 0xbb, 0x9f, 0x8a, 0xc9, 0x73, 0xfb, 0x10, 0x05, }, // bulletym
+  { 0xe7, 0xd2, 0x8a, 0x60, 0xdb, 0x2d, 0x63, 0x01, 0x41, 0x82, 0xc6, 0xb4, 0x3e, 0x31, 0xb6, 0xd0, }, // factoryr
+  { 0xb2, 0x85, 0xd7, 0x06, 0x90, 0x91, 0x58, 0x01, 0x43, 0xa4, 0x46, 0x29, 0x69, 0xd6, 0xda, 0xd2, }, // sse
+  { 0x08, 0xca, 0x0a, 0x23, 0xf8, 0x15, 0x28, 0x13, 0x4f, 0xce, 0x35, 0xb1, 0x97, 0xec, 0xe9, 0xc8, }, // sorry
+  { 0xa6, 0xe0, 0xaa, 0xa1, 0x5f, 0x48, 0x30, 0x80, 0x93, 0x49, 0x23, 0x8d, 0xf8, 0xa5, 0x6c, 0xbd, }, // count
+};
+
+const byte hack[] = { 0x52, 0xa4, 0x4c, 0x3d, 0x3f, 0x5f, 0x40, 0xf2, 0xa3, 0x89, 0x3a, 0xfc, 0x23, 0x8a, 0x54, 0x43, 0x7f, 0xd7, 0x37, 0x60, 0xd4, 0xea, 0xf3, 0x02, 0x22, 0xe8, 0x47, 0x72, 0x9b, 0x35, 0xb4, 0xb1, 0x35, 0xad, 0xbf, 0xec, 0x48, 0xab, 0xdd, 0xcd, 0xf3, 0xeb, 0x38, 0xbf, };
+const byte one337[] = { 0x71, 0x97, 0xb9, 0x24, 0xe5, 0x89, 0xb1, 0x13, 0x49, 0x76, 0xb5, 0x61, };
+const byte cyber[] = { 0xb5, 0x43, 0x1d, 0x81, 0xb3, 0x84, 0xcf, 0x2b, 0xda, 0x93, 0x43, 0x93, 0xca, 0x4f, 0xee, 0x27, 0x74, 0x20, 0x92, 0xcc, 0x11, 0x43, 0x0e, 0x4e, 0xca, 0xde, 0x5b, 0x68, 0x7a, 0x8a, 0x8e, 0x76, };
+const byte cyber2[] = { 0xcb, 0xe8, 0xce, 0xcd, 0x6e, 0x52, 0x11, 0xc6, 0x49, 0x70, 0x87, 0xe9, 0x09, 0x71, 0x9b, 0xa0, 0x45, 0x22, 0xac, 0xdb, 0x64, 0xd7, 0x31, 0x36, 0x3f, 0x84, 0xd7, 0x78, 0xcf, 0xaa, 0xe3, 0x92, 0x4f, 0xe5, 0xd8, 0x46, 0xd5, 0x44, 0xf9, 0x0c, };
+const byte wbm[] = { 0xf9, 0x3d, 0xf5, 0xf3, 0xc2, 0xf3, 0xb8, 0xec, 0x8a, 0xbe, 0x71, 0x51, 0x0d, 0x34, 0x20, 0xfb, 0x5e, 0x1c, 0xfe, 0x6b, 0x79, 0x66, 0x02, 0x3d, 0xc9, 0xf1, 0x23, 0x6e, 0x27, 0x4f, 0xc5, 0x46, };
+const byte supersat[] = { 0xaa, 0xfb, 0xb1, 0x48, 0xfa, 0x90, 0xb9, 0x45, 0x35, 0xfb, 0x9b, 0x8d, 0xed, 0x32, 0x74, 0x8f, 0xc7, 0x8d, 0xa4, 0x70, 0xae, 0xc7, 0xe7, 0x7c, };
+const byte jorge[] = { 0x5d, 0x68, 0x20, 0xf2, 0x06, 0x4b, 0xf0, 0x98, 0xc5, 0xca, 0x5c, 0xcd, 0x7c, 0x03, 0xef, 0x52, 0x5a, 0xc3, 0x70, 0x2f, 0xdd, 0xf1, 0x87, 0x7e, };
+const byte gibson[] = { 0x3a, 0x92, 0x35, 0x18, 0x6f, 0xe9, 0x19, 0xb0, 0xb8, 0x8b, 0x2c, 0x74, 0xf5, 0x2f, 0x7a, 0x78, 0x12, 0x93, 0x7b, 0xf9, 0x41, 0x65, 0xd2, 0xd3, 0x1f, 0x42, 0x38, 0xbe, 0xa2, 0xc4, 0x32, 0x84, 0x49, 0x8c, 0x96, 0x75, 0x70, 0xcf, 0xb1, 0xa1, };
+const byte acidburn[] = { 0x3a, 0xd0, 0x81, 0x9b, 0xd1, 0x39, 0x5c, 0xa6, 0x88, 0x68, 0xff, 0x28, 0xa9, 0xb8, 0x75, 0xde, };
+const byte zerocool[] = { 0x79, 0xfd, 0x8d, 0x29, 0xaa, 0x6b, 0x4c, 0x95, 0xb1, 0x3b, 0x7e, 0xa2, 0x1f, 0x63, 0x48, 0x8a, 0x3e, 0x11, 0x49, 0xff, 0x19, 0x36, 0x92, 0x1d, 0x29, 0xd3, 0xf2, 0xe5, 0xb2, 0xc0, 0x58, 0x56, 0x7b, 0x0a, 0xa0, 0xf5, 0x28, 0x91, 0x6c, 0xa5, };
+const byte joegrand[] = { 0x55, 0xda, 0xec, 0xce, 0x95, 0x2b, 0x08, 0xdc, 0x4d, 0x2d, 0x7e, 0x0e, 0x98, 0x4c, 0x80, 0x11, 0x58, 0x85, 0x67, 0x20, };
+const byte jeffmoss[] = { 0x43, 0xf3, 0x47, 0xf5, 0x17, 0xed, 0x3d, 0x78, 0x6d, 0x8d, 0x10, 0x47, 0x2f, 0x09, 0x5c, 0x5f, };
+const byte travis[] = { 0xfb, 0x46, 0x83, 0x95, 0xc6, 0xe9, 0xca, 0x13, 0xd3, 0x32, 0xe0, 0xfd, 0x70, 0x9b, 0x57, 0xb6, 0x06, 0x0f, 0x16, 0x68, };
+const byte ossmann[] = { 0x9c, 0x26, 0x2c, 0xbb, 0x3f, 0xb3, 0xdd, 0x67, 0x40, 0xb8, 0x1d, 0x66, 0xef, 0xff, 0x93, 0x51, 0x38, 0x25, 0xce, 0x26, 0x69, 0x0a, 0x46, 0xbf, 0xcc, 0x99, 0x36, 0x12, 0xc1, 0xf4, 0x36, 0xd3, };
+const byte gmark[] = { 0xda, 0xfd, 0x62, 0x8d, 0xcf, 0x93, 0x37, 0x23, 0xf4, 0xec, 0xab, 0xd2, 0xac, 0x55, 0x4f, 0x96, 0xba, 0x58, 0x1b, 0x7f, };
+const byte nsa[] = { 0x1e, 0x9c, 0xfc, 0x7e, 0x11, 0xf6, 0x6d, 0x0a, 0x6e, 0xbd, 0x81, 0x7e, };
+const byte goon[] = { 0xef, 0x05, 0xe8, 0x60, 0x6c, 0x7a, 0xaf, 0x20, 0x0c, 0x9d, 0x8e, 0xdb, };
+const byte beer[] = { 0x41, 0xd9, 0xd8, 0x47, 0xbd, 0xfe, 0xca, 0x74, 0x75, 0xac, 0x35, 0xea, 0xc0, 0x80, 0xb8, 0x6e, };
+const byte had[] = { 0x60, 0x0b, 0x24, 0x9d, 0xb6, 0xdc, 0xd5, 0xba, 0xc6, 0xb5, 0x7b, 0x58, };
+const byte ninja[] = { 0x4a, 0xf8, 0x45, 0x33, 0xf4, 0x64, 0xe7, 0x7b, 0x32, 0xd9, 0x2b, 0x4f, 0x1b, 0x06, 0x78, 0xcb, };
+const byte neon[] = { 0x38, 0xc1, 0xff, 0xa2, 0xa2, 0x82, 0x5e, 0x2c, 0x16, 0x11, 0x41, 0xf6, 0x85, 0xfa, 0xf7, 0x26, 0xa0, 0x32, 0x83, 0x33, 0xc4, 0x7f, 0x34, 0x2e, 0xba, 0xaf, 0xc8, 0x93, };
+const byte diffie[] = { 0x3a, 0x5d, 0x35, 0x92, 0x53, 0xb7, 0xad, 0x69, 0x5d, 0xc0, 0x7d, 0x99, 0xb0, 0x6a, 0x85, 0x02, 0xaf, 0xb6, 0x22, 0xe3, 0xb7, 0xc5, 0x6c, 0x73, };
+const byte hellman[] = { 0xbe, 0x28, 0x90, 0x64, 0x26, 0x52, 0x3e, 0xe0, 0xc3, 0xaa, 0xd3, 0xaa, 0x12, 0x6d, 0x7c, 0x3d, 0xb5, 0x88, 0x0b, 0x27, 0xdc, 0x46, 0xae, 0xbe, };
+const byte lost[] = { 0x57, 0x93, 0xac, 0xd4, 0x10, 0xd3, 0xb3, 0xe9, 0x31, 0x6d, 0xdc, 0xa5, 0x2b, 0x95, 0x4c, 0x24, 0xc7, 0x84, 0xc8, 0xc7, 0x98, 0xde, 0x54, 0x82, 0xd4, 0xe7, 0xd0, 0x1d, 0x78, 0x7e, 0x54, 0x95, 0xef, 0xb0, 0x3b, 0x5a, 0xbe, 0xef, 0x5b, 0xa9, 0x07, 0xcd, 0x39, 0x95, 0x4b, 0x08, 0xdd, 0x4c, 0xa1, 0xeb, 0x16, 0x4d, };
+const byte defcon[] = { 0x1d, 0x9b, 0xdc, 0xc4, 0x29, 0xc3, 0x87, 0x51, 0xb5, 0xe5, 0xd9, 0x03, 0x4e, 0x32, 0xaa, 0x63, 0xd7, 0x17, 0xf8, 0x52, };
+const byte defcoin[] = { 0xc4, 0x4f, 0x74, 0xfe, 0xd4, 0x2c, 0x44, 0x82, 0xbc, 0x9a, 0x14, 0x2d, 0x9e, 0xea, 0x11, 0x96, 0xe2, 0x29, 0x2a, 0x75, 0xad, 0x0c, 0x90, 0x3d, 0x4b, 0xd8, 0x59, 0xeb, 0x21, 0x4e, 0xf2, 0xb8, 0xc9, 0x86, 0xc4, 0xc9, };
+const byte alice[] = { 0xe1, 0x20, 0xae, 0xbb, 0x62, 0xdd, 0xd8, 0x61, 0x6b, 0x80, 0xc8, 0xfe, 0x24, 0xc3, 0xd3, 0xf7, 0xa0, 0x17, 0x04, 0xd9, };
+const byte bob[] = { 0xdc, 0x8a, 0x93, 0x5b, 0x9e, 0xb9, 0x92, 0x58, 0x83, 0xd9, 0x30, 0x4d, 0x33, 0x17, 0xc4, 0xc9, 0xb6, 0x2c, 0x94, 0x7c, 0xe5, 0x1c, 0x17, 0xc0, 0xf3, 0xfa, 0x92, 0xf8, 0x9d, 0xe0, 0x6d, 0xc0, 0x8c, 0x2c, 0xf3, 0x21, 0x89, 0xc6, 0xca, 0x52, 0x94, 0x11, 0x6f, 0x7f, 0x70, 0xcd, 0xeb, 0x15, 0xb6, 0x4b, 0xb7, 0x09, 0xdb, 0x99, 0x22, 0x3f, 0x7d, 0x90, 0xba, 0x3e, 0x76, 0xe5, 0x9e, 0xe7, 0x90, 0xdf, 0x0b, 0x47, 0x6c, 0x2b, 0xe9, 0xc5, 0x59, 0xb0, 0xb9, 0x3d, 0xa5, 0xe2, 0x96, 0x8b, 0xe0, 0xd7, 0xa2, 0x7b, };
+const byte rot13[] = { 0x87, 0x8a, 0x10, 0x6d, 0x19, 0x2c, 0x5a, 0x25, 0x38, 0x3b, 0x0f, 0xe4, };
+const byte openssl[] = { 0x1c, 0xe0, 0x35, 0x2d, 0x9f, 0x36, 0xba, 0x90, 0x0d, 0x8c, 0xed, 0x30, 0xd2, 0xcc, 0x45, 0x6e, };
+const byte eve[] = { 0x61, 0xd9, 0x8b, 0xb2, 0x8c, 0xf5, 0xd4, 0xb4, 0xba, 0xbc, 0x3b, 0x0a, 0xd3, 0x4a, 0x89, 0xf6, 0x32, 0x62, 0xf5, 0x72, 0xec, 0xdb, 0xdf, 0xac, 0xb0, 0xf8, 0x99, 0xf7, };
+const byte eff[] = { 0x6e, 0xaa, 0xa9, 0xad, 0x34, 0x6e, 0x5b, 0x99, 0x67, 0x08, 0x6a, 0x66, 0x9c, 0x1d, 0x12, 0x64, 0xc5, 0x47, 0x14, 0x55, 0xa5, 0xd0, 0x02, 0x80, };
+const byte darthnul[] = { 0x5e, 0x04, 0xb6, 0xfe, 0x62, 0xa5, 0x4f, 0x4b, 0xe2, 0xb5, 0x81, 0x7e, 0x38, 0x25, 0x48, 0xbb, 0xc3, 0x63, 0x81, 0x42, 0xcb, 0xc8, 0x2a, 0x96, 0x2f, 0x8f, 0xa4, 0x11, 0x67, 0xd3, 0xa1, 0x9b, 0xb2, 0x67, 0x61, 0x06, 0xa9, 0x16, 0xe4, 0xd1, 0x5b, 0x5e, 0x39, 0x21, 0x61, 0x04, 0x4f, 0x20, 0x00, 0x73, 0x5a, 0x0c, 0xd4, 0xb6, 0xac, 0xf4, 0x48, 0x78, 0xb4, 0xac, };
+const byte wargames[] = { 0xb2, 0x61, 0x97, 0xde, 0xd7, 0x59, 0x7f, 0x0e, 0x8b, 0x4e, 0x4b, 0x33, 0xa8, 0x31, 0xee, 0x82, 0xf6, 0xb2, 0x65, 0xf7, 0xc0, 0x18, 0x13, 0xd1, };
+const byte thenet[] = { 0x6c, 0x38, 0xbd, 0xa0, 0x23, 0x47, 0xb0, 0x44, 0x92, 0x54, 0x63, 0x1f, 0x48, 0xd3, 0xc2, 0x5c, 0xd8, 0xc7, 0x5b, 0xa3, 0x1c, 0xf2, 0xc6, 0x44, 0xb3, 0x42, 0x83, 0x52, 0xef, 0x56, 0xff, 0xf9, 0xc6, 0x59, 0x96, 0xef, 0x37, 0x5a, 0xdd, 0x8a, 0x0b, 0x31, 0x34, 0xbf, 0x38, 0x2d, 0x7b, 0xb2, 0xfc, 0x4a, 0x7f, 0x1e, 0xce, 0x11, 0xb0, 0x04, 0xfd, 0xa5, 0x2c, 0x70, 0x8c, 0x0f, 0xa3, 0x70, 0xc9, 0xd4, 0x7b, 0x78, };
+const byte sneakers[] = { 0x68, 0x66, 0xb8, 0x4f, 0x92, 0x4b, 0xaa, 0x55, 0xf0, 0x03, 0x1a, 0x3f, 0x59, 0x5d, 0xb5, 0x62, 0xeb, 0x7d, 0xff, 0xfb, 0xad, 0x2d, 0x39, 0x6e, 0x8d, 0x03, 0xee, 0x5a, 0x48, 0x32, 0x36, 0x54, 0x10, 0x2c, 0xb9, 0x32, 0xd5, 0x1d, 0x9d, 0x30, 0xe3, 0x73, 0xfb, 0xc6, 0x05, 0xab, 0x01, 0x8a, 0x1d, 0x41, 0xa1, 0x3a, 0x96, 0x49, 0xa2, 0x6d, 0x8f, 0xa4, 0x40, 0xcc, 0x8f, 0x2e, 0xe2, 0x07, 0x8d, 0xed, 0xc6, 0xc1, 0x1e, 0x96, 0x6b, 0xc8, 0x5f, 0x4f, 0x03, 0x06, 0xa2, 0xa0, 0xb2, 0x17, 0xf8, 0x46, 0x18, 0x85, 0x41, 0xc5, 0x1f, 0x3b, 0xaf, 0xc1, 0x7f, 0xb6, 0x1e, 0x57, 0xff, 0xef, 0xf4, 0xa2, 0x77, 0x09, 0xdc, 0x2d, 0x87, 0x2d, 0xdc, 0x90, 0xd7, 0x31, 0xa2, 0x69, 0x79, 0xae, 0xa3, 0x7a, 0x78, 0x1f, 0xe4, 0x2b, 0xe3, 0x2a, 0xf4, 0xd2, 0xe7, 0xc5, 0x75, 0xca, 0x0b, 0x4a, 0x4a, 0x7f, 0xac, 0x8e, 0x83, 0xeb, 0xaf, 0xc5, 0x78, 0x7e, 0x67, 0x70, 0x1a, 0x70, 0xad, 0xde, };
+const byte setec[] = { 0xf1, 0x46, 0x46, 0xe6, 0x5a, 0xcc, 0x06, 0xfc, 0xf8, 0x65, 0xcc, 0x95, 0xc5, 0xba, 0x6f, 0x54, 0xb0, 0x7c, 0x67, 0x78, 0x3d, 0xb6, 0xf9, 0x4b, };
+const byte lotr[] = { 0xc6, 0xba, 0x93, 0x99, 0xff, 0xb0, 0x23, 0x50, 0x6d, 0x2f, 0x3d, 0xd4, 0x25, 0x53, 0x6a, 0xb6, 0x8e, 0xb6, 0x44, 0xba, 0x0d, 0x44, 0xdb, 0x73, 0xd2, 0x93, 0x1a, 0x93, 0x13, 0x00, 0x53, 0x22, };
+const byte scorpion[] = { 0xed, 0x45, 0xcf, 0x63, 0xe4, 0x15, 0xdc, 0x74, 0xfa, 0x25, 0xac, 0x6d, 0xaa, 0x9a, 0x7e, 0xa2, 0x48, 0x00, 0xaf, 0x0e, 0xa5, 0x20, 0x53, 0x13, 0x70, 0x0e, 0xfc, 0x8f, 0x49, 0x2b, 0xf1, 0x83, 0x05, 0x87, 0x67, 0x98, 0xdf, 0xf8, 0x8b, 0x91, 0x39, 0x45, 0x0e, 0x02, 0x8c, 0xa5, 0x21, 0xa9, 0xc0, 0x18, 0x57, 0x64, 0xc2, 0x58, 0xea, 0x14, 0x73, 0xfb, 0x81, 0x50, };
+struct eggInfo_t {
+  const byte *ptr;
+  int eggLen;
+};  
+
+const eggInfo_t eggInfo[] = {
+  { (const byte*)0x80, 0 },
+  { hack, sizeof(hack), },
+  { one337, sizeof(one337), },
+  { cyber, sizeof(cyber), },
+  { cyber2, sizeof(cyber2), },
+  { wbm, sizeof(wbm), },
+  { supersat, sizeof(supersat), },
+  { jorge, sizeof(jorge), },
+  { gibson, sizeof(gibson), },
+  { acidburn, sizeof(acidburn), },
+  { zerocool, sizeof(zerocool), },
+  { joegrand, sizeof(joegrand), },
+  { jeffmoss, sizeof(jeffmoss), },
+  { travis, sizeof(travis), },
+  { ossmann, sizeof(ossmann), },
+  { gmark, sizeof(gmark), },
+  { nsa, sizeof(nsa), },
+  { goon, sizeof(goon), },
+  { beer, sizeof(beer), },
+  { had, sizeof(had), },
+  { ninja, sizeof(ninja), },
+  { neon, sizeof(neon), },
+  { diffie, sizeof(diffie), },
+  { hellman, sizeof(hellman), },
+  { lost, sizeof(lost), },
+  { (const byte*)0x81, 0, },
+  { (const byte*)0x82, 0, },
+  { defcon, sizeof(defcon), },
+  { defcoin, sizeof(defcoin), },
+  { alice, sizeof(alice), },
+  { bob, sizeof(bob), },
+  { eve, sizeof(eve), },
+  { rot13, sizeof(rot13), },
+  { openssl, sizeof(openssl), },
+  { eff, sizeof(eff), },
+  { darthnul, sizeof(darthnul), },
+  { wargames, sizeof(wargames), },
+  { thenet, sizeof(thenet), },
+  { sneakers, sizeof(sneakers), },
+  { setec, sizeof(setec), },
+  { lotr, sizeof(lotr), },
+  { (const byte*)0x83, 0, },
+  { (const byte*)0x84, 0, },
+  { (const byte*)0x85, 0, },
+  { (const byte*)0x86, 0, },
+  { (const byte*)0x87, 0, },
+  { scorpion, sizeof(scorpion), },
+  { (const byte*)0x88, 0, },
+  { (const byte*)0x89, 0, },
+  { (const byte*)0x8a, 0, },
+  { (const byte*)0x8b, 0, },
+  { (const byte*)0x8c, 0, },
+  { (const byte*)0x8d, 0, },
+  { (const byte*)0x8e, 0, },
+  { (const byte*)0x8f, 0, },
+};
+
+char eggMsgBuf[256] __attribute__ ((aligned (2)));
+byte partyLength;
+
+byte flagFound;
+
+const byte verifyDisplaySeq[] = {
+  0xc8, 0xc1, 0x85, 0x94, 0x92, 0x8a
+};
+
+byte verifyFlag(char *flag)
+{
+  char key[16];
+  char block[16];
+  char prevHash[16];
+  int dispSeq = 0;
+
+  memset(block, 0, 16);
+  block[15] = 1;
+  strncpy(key, flag, 8);
+  strncpy(key + 8, flag, 8);
+   
+  for (int i = 0; i < NITERS; i++) {
+    btea((long *)block, 4, (long *)key);
+    if ((i & 0x3f) == 0) {
+      if (++dispSeq == sizeof(verifyDisplaySeq))
+        dispSeq = 0;
+      memset(dispBuf, verifyDisplaySeq[dispSeq], 8);
+    }
+    
+    refreshDisplay();
+    updateButtonStatus();
+  }
+  
+  memcpy(prevHash, block, 16);
+  btea((long *)block, 4, (long *)key);
+  
+  for (int i = 0; i < 12; i++) {
+    if (!memcmp(block, flags[i], 16)) {
+      if (!(nvm->challengesSolved & (1 << i)))
+        return 2;
+      unlockFlash();
+      nvm->challengesSolved &= ~(1 << i);
+      strncpy(nvm->flags[i], flag, 8);
+      //memcpy(nvm->flagHashes[i], prevHash, 16);
+      lockFlash();
+      flagFound = i;
+      return 1;
+    }
+  }
+  
+  for (int i = 0; i < sizeof(eggInfo) / sizeof(eggInfo[0]); i++) {
+    if (!memcmp(block, easterEggs[i], 16)) {
+      if ((unsigned short)eggInfo[i].ptr > 0xff) {
+        memcpy(eggMsgBuf, eggInfo[i].ptr, eggInfo[i].eggLen);
+        btea((long *)eggMsgBuf, -(eggInfo[i].eggLen >> 2), (long *)prevHash);
+        return 3;
+      } else {
+        return (byte)((unsigned short)eggInfo[i].ptr & 0xff);
+      }
+    }
+  }
+  
+  return 0;
+}
+
+#pragma vector=TIMER0_A0_VECTOR
+__interrupt void ta0cc0_isr(void)
+{
+  if (TBCCR1 == 7) {
+    TBCCR1 = 22;
+  } else {
+    TBCCR1 = 7;
+  }
+  updateButtonStatus();
+}
+
+void set_freq(unsigned int freq)
+{
+  TACCR0 = 8000000L / freq;
+}
+
+struct music_t {
+  unsigned int freq;
+  unsigned int length;
+};
+
+const music_t tetris[] = {
+  { 330, 400 },
+  { 247, 200 },
+  { 262, 200 },
+  { 294, 400 },
+  { 262, 200 },
+  { 247, 200 },
+  { 220, 400 },
+  { 20000, 10 },
+  { 220, 200 },
+  { 262, 200 },
+  { 330, 400 },
+  { 294, 200 },
+  { 262, 200 },
+  { 247, 600 },
+  { 262, 200 },
+  { 294, 400 },
+  { 330, 400 },
+  { 262, 400 },
+  { 220, 400 },
+  { 20000, 10 },
+  { 220, 400 },
+  { 20000, 600 },
+
+  { 294, 400 },
+  { 349, 200 },
+  { 440, 400 },
+  { 392, 200 },
+  { 349, 200 },
+  { 330, 600 },
+  { 262, 200 },
+  { 330, 400 },
+  { 294, 200 },
+  { 262, 200 },
+  { 247, 400 },
+  { 20000, 10 },
+  { 247, 200 },
+  { 262, 200 },
+  { 294, 400 },
+  { 330, 400 },
+  { 262, 400 },
+  { 220, 400 },
+  { 20000, 10 },
+  { 220, 600 },
+  { 20000, 200 },
+
+  { 330, 800 },
+  { 262, 800 },
+  { 294, 800 },
+  { 247, 800 },
+  { 262, 800 },
+  { 220, 800 },
+  { 208, 800 },
+  { 247, 800 },
+  { 20000, 50 },
+
+  { 330, 800 },
+  { 262, 800 },
+  { 294, 800 },
+  { 247, 800 },
+  { 262, 400 },
+  { 330, 400 },
+  { 440, 400 },
+  { 20000, 10 },
+  { 440, 400 },
+  { 415, 600 },
+  { 20000, 800 },
+  
+  { 1000, 80 },
+  { 20000, 80 },
+  { 1000, 80 },
+  { 20000, 80 },
+  { 1000, 80 },
+  { 20000, 240 },
+  
+  { 1000, 240 },
+  { 20000, 80 },
+  { 1000,  240 },
+  { 20000, 80 },
+  { 1000, 80 },
+  { 20000, 80 },
+  { 1000, 240 },
+  { 20000, 240 },
+  
+  { 1000, 80 },
+  { 20000, 80 },
+  { 1000, 240 },
+  { 20000, 80 },
+  { 1000, 80 },
+  { 20000, 240 },
+  
+  { 1000, 80 },
+  { 20000, 80 },
+  { 1000, 240 },
+  { 20000, 80 },
+  { 1000, 240 },
+  { 20000, 240 },
+  
+  { 1000, 80 },
+  { 20000, 80 },
+  { 1000, 240 },
+  { 20000, 240 },
+  
+  { 1000, 80 },
+  { 20000, 80 },
+  { 1000, 80 },
+  { 20000, 80 },
+  { 1000, 80 },
+  { 20000, 80 },
+  { 1000, 240 },
+  { 20000, 240 },
+  
+  { 1000, 80 },
+  { 20000, 240 },
+  
+  { 1000, 80 },
+  { 20000, 80 },
+  { 1000, 80 },
+  { 20000, 80 },
+  { 1000, 80 },
+  { 20000, 500 },
+};
+
+void enterRFMode()
+{
+  P1OUT = 0xff;
+  P2OUT = 0xff;
+  P3OUT = 0xff;
+  P4OUT = 0xff;
+  
+  P4SEL = (1 << 1);
+  
+  TBCCR0 = 28;
+  TBCCR1 = 7;
+  TBCCTL1 = (3 << 5); // outmod = set/reset
+  
+  TACCR0 = 16000;
+  TACCTL0 = CCIE; // Enable interrupt
+  
+  TBCTL = (2 << 8) | // SMCLK
+          (1 << 4); // Up mode
+  TACTL = (2 << 8) | // SMCLK
+          (1 << 4); // | // Up mode
+          (1 << 1); // Interrupt enabled
+  
+  for (;;) {
+    for (int i = 0; i < sizeof(tetris) / sizeof(tetris[0]); i++) {
+      set_freq(tetris[i].freq);
+      delay(tetris[i].length);
+      if (buttonStatus & (LEFT_PRESSED | RIGHT_PRESSED)) {
+        TBCTL = 0;
+        TACTL = 0;
+        P4SEL &= ~(1 << 1);
+        return;
+      }
+    }
+  }
+}
+
+void ledChallengeUpdate()
+{
+  static unsigned long lastLEDUpdate = 0;
+  static unsigned short ledCount = 0;
+  static byte walkStart = 0;
+  static byte walkIndex = 0;
+  static byte pongSlowLED = 0;
+  static char pongFastLED = 11;
+  static char pongDir = -1;
+  byte ledMode = (tempModeFlag >> 5) & 0x7;
+  unsigned long currentMillis = millis();
+  
+  switch (ledMode) {
+  case 1: // LED1
+    if (currentMillis - lastLEDUpdate > 250) {
+      lastLEDUpdate = currentMillis;
+      for (int i = 0; i < 12; i++) {
+        ledBuf[i] = lfsr(8) & 1 ? maxLEDBrightness : 0;
+      }
+    }
+    break;
+  case 2: // LED2
+    if (currentMillis - lastLEDUpdate > 50) {
+      lastLEDUpdate = currentMillis;
+      if (walkIndex & 0x80) {
+        ledBuf[walkIndex & 0x0f] = 0;
+      } else {
+        ledBuf[walkIndex] = maxLEDBrightness;
+      }
+      if ((++walkIndex & 0x0f) == 12) {
+        walkIndex = walkIndex & 0x80;
+      }
+      if ((walkIndex & 0x0f) == walkStart) {
+        walkIndex = (walkIndex ^ 0x80);
+      }
+      if (walkIndex == walkStart) {
+        if (++walkStart == 12) {
+          walkStart = 0;
+        }
+        walkIndex = walkStart;
+      }
+    }
+    break;
+  case 3: // Count
+    if (currentMillis - lastLEDUpdate > 250) {
+      lastLEDUpdate = currentMillis;
+      ledCount = ledCount + 1;
+      for (int i = 0; i < 12; i++) {
+        ledBuf[i] = (ledCount & (1 << i)) ? maxLEDBrightness : 0;
+      }
+    }
+    break;
+  case 4: // Pong
+    if (currentMillis - lastLEDUpdate > 100) {
+      lastLEDUpdate = currentMillis;
+      ledBuf[pongSlowLED >> 2] = 0;
+      if (((++pongSlowLED) >> 2) == 12) {
+        pongSlowLED = 0;
+      }
+      ledBuf[pongSlowLED >> 2] = maxLEDBrightness;
+      ledBuf[pongFastLED] = 0;
+      if (((pongFastLED + pongDir) % 12) == pongSlowLED) {
+        pongDir = ~pongDir;
+      }
+      pongFastLED += pongDir;
+      if (pongFastLED == 12) {
+        pongFastLED = 0;
+      } else if (pongFastLED == -1) {
+        pongFastLED = 11;
+      }
+      ledBuf[pongFastLED] = maxLEDBrightness;
+    }
+    break;
+  default:
+    if (nvm->challengesSolved == 0xf000) {
+      if (currentMillis - lastLEDUpdate > 50) {
+        lastLEDUpdate = currentMillis;
+        for (int i = 0; i < 12; i++) {
+          ledBuf[i] = lfsr(8) & 1 ? maxLEDBrightness : 0;
+        }
+      }
+    } else {
+      for (int i = 0; i < 12; i++) {
+        if (!(nvm->challengesSolved & (1 << i))) {
+          if (currentMillis & 1024) {
+            ledBuf[i] = 0xff - ((currentMillis >> 2) & 0xff);
+          } else {
+            ledBuf[i] = ((currentMillis >> 2) & 0xff);
+          }
+          if (maxLEDBrightness != 0xff) {
+            ledBuf[i] >>= 1;
+          }
+        } else {
+          ledBuf[i] = 0;
+        }
+      }
+    }
+    break;
+  }
+}
+
+unsigned long lastScrollUpdate;
+char scrollBuf[256];
+byte scrollOffset;
+badgeState_t afterScrollMode;
+
+void enterScrollMode()
+{
+  lastScrollUpdate = 0;
+  scrollOffset = 0;
+  badgeState = SCROLL_MODE;
+}
+
+void scrollMode()
+{
+  unsigned long currentMillis = millis();
+  
+  if ((currentMillis - lastScrollUpdate) > 200) {
+    lastScrollUpdate = currentMillis;
+    if (scrollOffset < 8) {
+      memset(dispBuf, 0, 8 - scrollOffset);
+      strncpy(dispBuf + 8 - scrollOffset, scrollBuf, scrollOffset);
+    } else {
+      if (!scrollBuf[scrollOffset - 8]) {
+        badgeState = afterScrollMode;
+        scrollOffset = 0;
+        return;
+      } else { 
+        strncpy(dispBuf, scrollBuf + scrollOffset - 8, 8);
+      }
+    }
+    
+    scrollOffset++;
+  }
+  
+  ledChallengeUpdate();
+}
+
+unsigned long lastSSEUpdate;
+byte sseOffset;
+
+const unsigned short sseLEDs[] = {
+  0b001010011100,
+  0b101000110000,
+  0b000010011000,
+  0b001010110100,
+  0b000110111000,
+  0b000010110110,
+  0b111010111110,
+  0b111000101110,
+  0b110010111010,
+  0b100110100000,
+  0b100100000000
+};
+
+void enterSSEMode()
+{
+  strncpy(scrollBuf, "look in to my eyes", 64);
+  enterScrollMode();
+  badgeState = SSE_MODE;
+  afterScrollMode = SSE_MODE;
+  lastSSEUpdate = 0;
+  sseOffset = -1;
+}
+
+
+void sseMode()
+{
+  unsigned long curMillis = millis();
+
+  scrollMode();
+  
+  if (curMillis - lastSSEUpdate > 1000) {
+    lastSSEUpdate = curMillis;
+    if (++sseOffset == 11) {
+      sseOffset = 0;
+    }
+  }
+  
+  for (int i = 0; i < 12; i++) {
+    ledBuf[i] = sseLEDs[sseOffset] & (1 << i) ? maxLEDBrightness : 0;
+  }
+}
+
+void enterSelfTestMode()
+{
+  badgeState = SELF_TEST_MODE;
+  strncpy(dispBuf, "88888888", 8);
+  for (int i = 0; i < 12; i++) {
+    ledBuf[i] = 0xff;
+  }
+}
+
+const byte selfTestSegSeq[] = {
+  0x02, 0x10, 0x04, 0x20, 0x08, 0x40, 0x01
+};
+  
+void selfTestMode()
+{
+  unsigned long currentMillis = millis();
+  static unsigned long lastFrameUpdate = 0;
+  static unsigned int led = 0;
+  static unsigned int segment = 0;
+  static unsigned int selChar = 0;
+ 
+  if (currentMillis > 1000) {
+    if (lastFrameUpdate == 0) {
+      memset(dispBuf, 0, 8);
+      lastFrameUpdate = currentMillis;
+    } else if ((currentMillis - lastFrameUpdate) > 50) {
+      lastFrameUpdate = currentMillis;
+      
+      ledBuf[led] = 0;
+      if (++led == 12)
+        led = 0;
+      ledBuf[led] = 0xff;
+      
+      memset(dispBuf, 0, 8);
+      if (++segment == 7) {
+        if (++selChar == 8)
+          selChar = 0;
+        segment = 0;
+      }
+      dispBuf[selChar] = selfTestSegSeq[segment] | 0x80;
+    }
+    
+    if (buttonStatus & LEFT_PRESSED)
+      dispBuf[0] = 'L';
+    if (buttonStatus & RIGHT_PRESSED)
+      dispBuf[7] = 'R';
+    if ((buttonStatus & (LEFT_PRESSED | RIGHT_PRESSED)) ==
+        (LEFT_PRESSED | RIGHT_PRESSED)) {
+          badgeState = DISPLAY_MODE;
+          buttonStatus |= IGNORE_LEFT_UP | IGNORE_RIGHT_UP;
+        }
+  }
+}
+
+unsigned long flagModeTime;
+byte successPWM;
+
+void enterFlagObtainedMode()
+{
+  badgeState = FLAG_OBTAINED_MODE;
+  flagModeTime = millis();
+  successPWM = 0;
+  memset(ledBuf, 0, 12);
+}
+
+void flagObtainedMode()
+{
+  unsigned long ms = millis() - flagModeTime;
+  
+  if (ms < 2048) {
+    successPWM++;
+    if (charPos == 0 && ms >= 32) {
+     if ((successPWM & 0x3f) < (ms >> 5)) {
+       strncpy(dispBuf, "SUCCESS", 8);
+     } else {
+       memset(dispBuf, 0, 8);
+     }
+    }
+  }
+  
+  if (ms >= 5000) {
+    badgeState = DISPLAY_MODE;
+    curString = 5;
+  }
+  
+  if (ms < 2560) {
+    if (ms & 512) {
+      ledBuf[flagFound] = 0xff - ((ms >> 1) & 0xff);
+    } else {
+      ledBuf[flagFound] = ((ms >> 1) & 0xff);
+    }
+  }
+      
+  if (ms > 2304) {
+    for (int j = 0; j < 6; j++) { 
+      if (ms > (2304 + 85 * j) && ms < (2816 + 85 * j)) {
+        unsigned long msOffset = ms - (2304 + 85 * j);
+        if (msOffset & 256) {
+          ledBuf[(flagFound + (j + 1)) % 12] = 0xff - (msOffset & 0xff);
+          ledBuf[(flagFound - (j + 1)) % 12] = 0xff - (msOffset & 0xff);
+        } else {
+          ledBuf[(flagFound + (j + 1)) % 12] = (msOffset & 0xff);
+          ledBuf[(flagFound - (j + 1)) % 12] = (msOffset & 0xff);
+        }
+      }
+    }
+  }
+}
+
+void enterFlagFailMode()
+{
+  badgeState = FLAG_FAIL_MODE;
+  flagModeTime = millis();
+  strncpy(dispBuf, "LOL FAIL", 8);
+}
+
+void flagFailMode()
+{
+  if (millis() > flagModeTime + 5000) {
+    badgeState = DISPLAY_MODE;
+    curString = 5;
+  }
+}
+
+char flagEntry[8];
+byte flagEntryPos;
+
+void enterFlagMode()
+{
+  strncpy(flagEntry, " ", 8);
+  flagEntryPos = 0;
+  badgeState = FLAG_ENTRY_MODE;
+}
+
+unsigned long lastPartyUpdate;
+unsigned long lastPartyBlinkOn;
+unsigned long partyBlinkOff;
+byte partyTime = 15;
+byte partyOffset = 0;
+
+void enterPartyMode()
+{
+  unlockFlash();
+  for (int i = 0; i < 64 - partyTime; i++) {
+    nvm->partyTime[i >> 3] &= ~(1 << (i & 7));
+  }
+  nvm->modeFlags &= ~MODE_FLAG_PARTY;
+  lockFlash();
+  
+  unsigned long curMillis = millis();
+  lastPartyUpdate = curMillis;
+  lastPartyBlinkOn = curMillis;
+  partyBlinkOff = curMillis + 30;
+  partyOffset = 0x80;
+  memset(ledBuf, 0xff, 12);
+  badgeState = PARTY_MODE;
+}
+
+void partyMode()
+{
+  unsigned long curMillis = millis();
+  int i;
+  
+  if (curMillis - lastPartyUpdate > 60000) {
+    for (i = 0; i < 64; i++) {
+      if (nvm->partyTime[i >> 3] & (1 << (i & 7))) {
+        unlockFlash();
+        nvm->partyTime[i >> 3] &= ~(1 << (i & 7));
+        lockFlash();
+        break;
+      }
+    }
+    if (i >= 63) {
+      byte savedModeFlags = nvm->modeFlags | MODE_FLAG_PARTY;
+      erasePersistantModes();
+      unlockFlash();
+      nvm->modeFlags = savedModeFlags;
+      lockFlash();
+      badgeState = DISPLAY_MODE;
+      curString = 0xff;
+    }
+    lastPartyUpdate = curMillis;
+  }
+  
+  if (partyBlinkOff && curMillis > partyBlinkOff) {
+    memset(ledBuf, 0x00, 12);
+    partyBlinkOff = 0;
+  }
+  
+  if (curMillis - lastPartyBlinkOn > 469) {
+    lastPartyBlinkOn = curMillis;
+    partyBlinkOff = curMillis + 30;
+    memset(ledBuf, 0xff, 12);
+    if (partyOffset & 0x80) {
+      if (++partyOffset == 0x84) {
+        partyOffset = 2;
+      }
+    } else {
+      if (--partyOffset == 0xff) {
+        partyOffset = 0x81;
+      }
+    }
+    memset(dispBuf, 0, 8);
+    strncpy(dispBuf + (partyOffset & 0x3), "party", 5);
+  }
+}
+
+void partyConfirmMode()
+{
+  strncpy(dispBuf, "Y      N", 8);
+  if (buttonStatus & LEFT_UP) {
+    enterPartyMode();
+  } else if (buttonStatus & RIGHT_UP) {
+    badgeState = DISPLAY_MODE;
+  }
+}
+
+const char specialFlagChars[] = "ABEQBFGEBAVK";
+
+void doVerifyFlag()
+{
+  byte res = verifyFlag(flagEntry);
+  
+  curString = 0xff;
+  
+  if (res == 0x8e) {
+    byte savedModeFlags = nvm->modeFlags | MODE_FLAG_FUCK;
+    erasePersistantModes();
+    unlockFlash();
+    nvm->modeFlags = savedModeFlags;
+    lockFlash();
+    strncpy(scrollBuf, "please dont do it again", 64);
+    enterScrollMode();
+    afterScrollMode = DISPLAY_MODE;
+    return;
+  } else if (!(nvm->modeFlags & MODE_FLAG_FUCK)) {
+    enterFlagFailMode();
+    return;
+  }
+  
+  switch (res) {
+  case 1:
+    enterFlagObtainedMode();
+    break;
+  case 2:
+    strncpy(scrollBuf, "no double dipping", 64);
+    enterScrollMode();
+    afterScrollMode = DISPLAY_MODE;
+    break;
+  case 3:
+    tempModeFlag |= TEMP_MODE_FLAG_EGG_MSG;
+    badgeState = DISPLAY_MODE;
+    curString = 4;
+    break;
+  case 0x80: // Matrix mode
+    tempModeFlag |= TEMP_MODE_FLAG_MATRIX;
+    strncpy(scrollBuf, "red pill enabled", 64);
+    enterScrollMode();
+    afterScrollMode = DISPLAY_MODE;
+    break;
+  case 0x81: // Knight rider mode
+  case 0x83: // LED1
+    tempModeFlag = (tempModeFlag & 0x1f) | TEMP_MODE_FLAG_LED1;
+    badgeState = DISPLAY_MODE;
+    break;
+  case 0x84: // LED2
+    tempModeFlag = (tempModeFlag & 0x1f) | TEMP_MODE_FLAG_LED2;
+    badgeState = DISPLAY_MODE;
+    break;
+  case 0x85: // PONG
+    tempModeFlag = (tempModeFlag & 0x1f) | TEMP_MODE_FLAG_PONG;
+    badgeState = DISPLAY_MODE;
+    break;
+  case 0x8f: // COUNT
+    tempModeFlag = (tempModeFlag & 0x1f) | TEMP_MODE_FLAG_COUNT;
+    badgeState = DISPLAY_MODE;
+    break;
+  case 0x82:
+    unlockFlash();
+    nvm->modeFlags &= ~MODE_FLAG_FUCK;
+    lockFlash();
+    badgeState = DISPLAY_MODE;
+    break;
+  case 0x86:
+    partyTime = 15;
+    strncpy(scrollBuf, "are you sure", 64);
+    enterScrollMode();
+    afterScrollMode = PARTY_CONFIRM_MODE;
+    break;
+  case 0x87:
+    partyTime = 60;
+    strncpy(scrollBuf, "are you sure", 64);
+    enterScrollMode();
+    afterScrollMode = PARTY_CONFIRM_MODE;
+    break;
+  case 0x88:
+    unlockFlash();
+    nvm->modeFlags &= ~MODE_FLAG_EFF_SUPPORTER;
+    lockFlash();
+    strncpy(scrollBuf, "thank you for supporting the eff", 64);
+    enterScrollMode();
+    afterScrollMode = DISPLAY_MODE;
+    break;
+  case 0x89:
+    enterRFMode();
+    badgeState = DISPLAY_MODE;
+    break;
+  case 0x8a:
+    maxLEDBrightness = 0xff;
+    memset(ledBuf, 0xff, 12);
+    strncpy(scrollBuf, "maximum brightness unlocked", 64);
+    enterScrollMode();
+    afterScrollMode = DISPLAY_MODE;
+    break;
+  case 0x8b:
+    tempModeFlag |= TEMP_MODE_FLAG_BULLET_TIME;
+    strncpy(scrollBuf, "bullet time unlocked", 64);
+    enterScrollMode();
+    afterScrollMode = DISPLAY_MODE;
+    break;
+  case 0x8c:
+    eraseFlash();
+    strncpy(scrollBuf, "flash nuked from orbit", 64);
+    enterScrollMode();
+    afterScrollMode = DISPLAY_MODE;
+    break;
+  case 0x8d:
+    enterSSEMode();
+    break;
+  default:
+    enterFlagFailMode();
+    break;
+  }
+}
+
+void flagEntryMode()
+{
+  static unsigned long leftDownTime;
+  static unsigned long rightDownTime;
+  unsigned long currentMillis = millis();
+  
+  if (buttonStatus & LEFT_DOWN) {
+    leftDownTime = currentMillis;
+  }
+  
+  if (buttonStatus & RIGHT_DOWN) {
+    rightDownTime = currentMillis;
+  }
+
+  if ((buttonStatus & LEFT_PRESSED) && leftDownTime) {
+    if (currentMillis - leftDownTime > 500) {
+      leftDownTime = 0;
+      if (flagEntryPos > 0) {
+        flagEntry[flagEntryPos--] = 0;
+      } else {
+        badgeState = DISPLAY_MODE;
+      }
+    }
+  }
+  
+  if ((buttonStatus & RIGHT_PRESSED) && rightDownTime) {
+    if (currentMillis - rightDownTime > 500) {
+      rightDownTime = 0;
+      if (flagEntryPos == 7) {
+        while (flagEntry[flagEntryPos] == ' ' && flagEntryPos) {
+          flagEntry[flagEntryPos--] = 0;
+        }
+        doVerifyFlag();
+        return;
+      } else {
+        flagEntry[++flagEntryPos] = ' ';
+      }
+    }
+  }
+  
+  if ((buttonStatus & LEFT_PRESSED) && (buttonStatus & RIGHT_PRESSED)) {
+    doVerifyFlag();
+    return;
+  }
+  
+  if ((buttonStatus & LEFT_UP) && leftDownTime) {
+    if (flagEntry[flagEntryPos] == 'A') {
+      flagEntry[flagEntryPos] = ' ';
+    } else if (flagEntry[flagEntryPos] == '0') {
+      flagEntry[flagEntryPos] = 'Z';
+    } else if (flagEntry[flagEntryPos] == ' ') {
+      flagEntry[flagEntryPos] = 'l';
+    } else if (flagEntry[flagEntryPos] == 'a') {
+      flagEntry[flagEntryPos] = '9'; 
+    } else {
+      flagEntry[flagEntryPos]--;
+    }
+  }
+  
+  if ((buttonStatus & RIGHT_UP) && rightDownTime) {
+    if (flagEntry[flagEntryPos] == 'Z') {
+      flagEntry[flagEntryPos] = '0';
+    } else if (flagEntry[flagEntryPos] == '9') {
+      flagEntry[flagEntryPos] = ' ';
+    } else if (flagEntry[flagEntryPos] == ' ') {
+      flagEntry[flagEntryPos] = 'A';
+    } else if (flagEntry[flagEntryPos] == 'l') {
+      flagEntry[flagEntryPos] = 'A';
+    } else {
+      flagEntry[flagEntryPos]++;
+    }
+  }
+  
+  memcpy(dispBuf, flagEntry, 8);
+  memset(ledBuf, 0, 12);
+
+  if (dispBuf[flagEntryPos] >= 'a') {
+    int i = dispBuf[flagEntryPos] - 'a';
+    dispBuf[flagEntryPos] = specialFlagChars[i];
+    ledBuf[i] = maxLEDBrightness;
+  }
+  
+  if ((currentMillis & 511) >= 256) {
+    dispBuf[flagEntryPos] = 0;
+  } else {
+    if (dispBuf[flagEntryPos] == ' ')
+      dispBuf[flagEntryPos] = 0x90;
+  }
+}
+
+byte flagSelected;
+
+void enterShowFlagMode()
+{
+  flagSelected = 0;
+  badgeState = SHOW_FLAG_MODE;
+  strncpy(dispBuf, nvm->flags[0], 8);
+  memset(ledBuf, 0, 12);
+  ledBuf[0] = 0xff;
+}
+
+void showFlagMode()
+{
+  if (buttonStatus & LEFT_UP) {
+    ledBuf[flagSelected] = 0;    
+    if (flagSelected == 0) {
+      flagSelected = 11;
+    } else {
+      flagSelected--;
+    }
+    strncpy(dispBuf, nvm->flags[flagSelected], 8);
+    ledBuf[flagSelected] = 0xff;
+  } else if (buttonStatus & RIGHT_UP) {
+    ledBuf[flagSelected] = 0;
+    if (++flagSelected == 12) {
+      flagSelected = 0;
+    }
+    strncpy(dispBuf, nvm->flags[flagSelected], 8);
+    ledBuf[flagSelected] = 0xff;
+  } else if ((buttonStatus & (LEFT_PRESSED | RIGHT_PRESSED)) == (LEFT_PRESSED | RIGHT_PRESSED)) {
+    buttonStatus |= IGNORE_LEFT_UP | IGNORE_RIGHT_UP;
+    badgeState = DISPLAY_MODE;
+    curString = 0;
+  }
+}
+
+char dispStr[8];
+
+void displayMode()
+{
+  //static byte curLedBrightness = 0;
+  static unsigned long lastStringUpdate = 0;
+  static unsigned long lastLedUpdate = 0;
+  static unsigned long lastMatrixUpdate = 0;
+  static byte matrixChars = 0xff;
+  static byte matrixCount = 0;
+  static byte buttonPresses = 0;
+  static byte effMode = 0;
+  short interval = (tempModeFlag & TEMP_MODE_FLAG_MATRIX) ? 2048 : 1024;
+
+  if ((buttonStatus & LEFT_UP) && (nvm->modeFlags & MODE_FLAG_FUCK)) {
+    buttonPresses = (buttonPresses << 1) | 1;
+    if (!(nvm->modeFlags & MODE_FLAG_EFF_SUPPORTER)) {
+      effMode++;
+      switch (effMode & 3) {
+      case 0:
+        tempModeFlag = (tempModeFlag & (TEMP_MODE_FLAG_EGG_MSG | TEMP_MODE_FLAG_MATRIX));
+        break;
+      case 1:
+        tempModeFlag = (tempModeFlag & (TEMP_MODE_FLAG_EGG_MSG | TEMP_MODE_FLAG_MATRIX)) | TEMP_MODE_FLAG_LED1;
+        break;
+      case 2:
+        tempModeFlag = (tempModeFlag & (TEMP_MODE_FLAG_EGG_MSG | TEMP_MODE_FLAG_MATRIX)) | TEMP_MODE_FLAG_LED2;
+        break;
+      case 3:
+        tempModeFlag = (tempModeFlag & (TEMP_MODE_FLAG_EGG_MSG | TEMP_MODE_FLAG_MATRIX)) | TEMP_MODE_FLAG_PONG;
+        break;
+      }
+      if (effMode & 4) {
+        tempModeFlag |= TEMP_MODE_FLAG_EGG_MSG;
+        strncpy(eggMsgBuf, "i fight for the users", 64);
+      } else {
+        tempModeFlag &= ~TEMP_MODE_FLAG_EGG_MSG;
+      }
+      if (effMode & 8) {
+        tempModeFlag |= TEMP_MODE_FLAG_MATRIX;
+      } else {
+        tempModeFlag &= ~TEMP_MODE_FLAG_MATRIX;
+      }
+    }
+  }
+  
+  if (buttonStatus & RIGHT_UP) {
+    if ((buttonPresses & 0x7f) == 0x65) {
+      buttonPresses = 0;
+      enterShowFlagMode();
+      return;
+    } else if (((buttonPresses & 0x3) != 3) &&
+               ((buttonPresses & 0x7) != 6) &&
+               ((buttonPresses & 0x1f) != 0x19)) {
+      enterFlagMode();
+      return;
+    } else {
+      buttonPresses <<= 1;
+    }    
+  }
+  
+  if (!(nvm->modeFlags & MODE_FLAG_FUCK)) {
+    strncpy(dispBuf, "\xa0\xa0\xa0\xa0\xa0\xa0\xa0\xa0", 8);
+    return;
+  }
+  
+  unsigned long currentMillis = millis();
+  if ((currentMillis - lastStringUpdate) > interval) {
+    lastStringUpdate = currentMillis;
+    curString++;
+    switch (curString) {
+    case 5:
+      if (tempModeFlag & TEMP_MODE_FLAG_EGG_MSG) {
+        strncpy(scrollBuf, eggMsgBuf, 64);
+        enterScrollMode();
+        afterScrollMode = DISPLAY_MODE;
+        return;
+      }
+      // Fall through
+    case 6:
+      curString = 0;
+      // Fall through
+    case 0:
+      strncpy(dispStr, "DEFCON23", 8);
+      strncpy(dispBuf, dispStr, 8);
+      matrixChars = 0xff;
+      break;
+    case 1:
+      strncpy(dispStr, " CRYPTO ", 8);
+      strncpy(dispBuf, dispStr, 8);
+      matrixChars = 0xff;
+      break;
+    case 2:
+      strncpy(dispStr, "  AND   ", 8);
+      strncpy(dispBuf, dispStr, 8);
+      matrixChars = 0xff;
+      break;
+    case 3:
+      strncpy(dispStr, "PRIVACY ", 8);
+      strncpy(dispBuf, dispStr, 8);
+      matrixChars = 0xff;
+      break;
+    case 4:
+      strncpy(dispStr, "VILLAGE ", 8);
+      strncpy(dispBuf, dispStr, 8);
+      matrixChars = 0xff;
+      break;
+    }
+  }
+  
+  if (tempModeFlag & TEMP_MODE_FLAG_MATRIX) {
+    if ((currentMillis - lastMatrixUpdate) > 32) {
+      lastMatrixUpdate = currentMillis;
+      for (int i = 0; i < 8; i++) {
+        if (matrixChars & (1 << i)) {
+          dispBuf[i] = (byte)lfsr(8) | 0x80;
+        } else {
+          dispBuf[i] = dispStr[i];
+        }
+      }
+      matrixCount = (matrixCount + 1) & 3;
+      if (matrixCount == 0) {
+        while (matrixChars) {
+          byte clearChar = lfsr(8) & 0x7;
+          if (matrixChars & (1 << clearChar)) {
+            matrixChars &= ~(1 << clearChar);
+            break;
+          }
+        }
+      }
+    }
+  }
+  
+  ledChallengeUpdate();
+  
+  /*
+  // This should rotate through the LEDs about one per second
+  if ((currentMillis - lastLedUpdate) > 83) {
+    lastLedUpdate = currentMillis;
+    ledBuf[curLed] = 0;
+    curLed++;
+    if (curLed >= 12) {
+      curLed = 0;
+    }
+    ledBuf[curLed] = 1;
+  }
+  */  
+}
+
+void setup()
+{
+  // put your setup code here, to run once:
+  
+  memset(dispBuf, 0, sizeof(dispBuf));
+  memset(ledBuf, 0, sizeof(ledBuf));
+  
+  P1DIR = 0xff;
+  P2DIR = 0xdf;
+  P3DIR = 0xf7;
+  P4DIR = 0xff;
+  
+  if (nvm->selfTestEnabled) {
+    enterSelfTestMode();
+    unlockFlash();
+    nvm->selfTestEnabled = 0;
+    lockFlash();
+  } else if (!(nvm->modeFlags & MODE_FLAG_PARTY)) {
+    enterPartyMode();
+  } else {
+    badgeState = DISPLAY_MODE;
+  }
+}
+
+void loop()
+{
+  // TODO: Make this interrupt-based to save power
+  updateButtonStatus();
+  switch (badgeState) {
+  case SELF_TEST_MODE:
+    selfTestMode();
+    break;
+  case DISPLAY_MODE:
+    displayMode();
+    break;
+  case FLAG_ENTRY_MODE:
+    flagEntryMode();
+    break;
+  case FLAG_OBTAINED_MODE:
+    flagObtainedMode();
+    break;
+  case FLAG_FAIL_MODE:
+    flagFailMode();
+    break;
+  case SCROLL_MODE:
+    scrollMode();
+    break;
+  case PARTY_CONFIRM_MODE:
+    partyConfirmMode();
+    break;
+  case PARTY_MODE:
+    partyMode();
+    break;
+  case SSE_MODE:
+    sseMode();
+    break;
+  case SHOW_FLAG_MODE:
+    showFlagMode();
+    break;
+  default:
+    strncpy(dispBuf, "  help  ", 8);  
+    break;
+  }
+  
+  refreshDisplay();
+  if (tempModeFlag & TEMP_MODE_FLAG_BULLET_TIME) {
+    sleep(20);
+  } else {
+    __delay_cycles(5000);  
+  }
+}
